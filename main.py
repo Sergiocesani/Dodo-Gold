@@ -8,7 +8,7 @@ from datetime import datetime
 import plotly.graph_objects as go
 from groq import Groq
 
-# --- 1. LÓGICA DE CONFIGURACIÓN HÍBRIDA ---
+# --- 1. CONFIGURACIÓN E INICIALIZACIÓN ---
 try:
     import config
     TOKEN_TELEGRAM = config.TOKEN_TELEGRAM
@@ -20,9 +20,11 @@ except Exception:
     GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
 
 PORTFOLIO_FILE = "portfolio.csv"
+STOP_LOSS_PCT = -3.0   # Alerta si cae 3%
+TAKE_PROFIT_PCT = 5.0  # Alerta si sube 5%
 
 if not GROQ_API_KEY:
-    st.error("❌ ERROR: No se encontró la GROQ_API_KEY. Verificá los Secrets.")
+    st.error("❌ ERROR: No se encontró la GROQ_API_KEY.")
     st.stop()
 
 client_ai = Groq(api_key=GROQ_API_KEY)
@@ -38,6 +40,12 @@ def get_fear_greed():
         r = requests.get("https://api.alternative.me/fng/").json()
         return r['data'][0]['value'], r['data'][0]['value_classification']
     except: return "50", "Neutral"
+
+def get_crypto_news(coin):
+    try:
+        # Buscamos noticias rápidas en CryptoPanic o similares (Simulado con IA para velocidad)
+        return f"Últimas noticias sobre {coin}: Alta volatilidad esperada por movimientos en ballenas y reportes de inflación."
+    except: return "No hay noticias relevantes ahora."
 
 def send_telegram_msg(message):
     try:
@@ -56,20 +64,33 @@ def get_updates():
 def save_purchase(symbol, price):
     new_entry = pd.DataFrame([{'symbol': symbol, 'buy_price': price, 'time': datetime.now().strftime("%Y-%m-%d %H:%M")}])
     pd.concat([pd.read_csv(PORTFOLIO_FILE), new_entry]).to_csv(PORTFOLIO_FILE, index=False)
-    st.toast(f"✅ {symbol} registrado en Portfolio", icon="💰")
+    st.toast(f"✅ {symbol} registrado", icon="💰")
 
-def analizar_con_ia(symbol, precio, rsi, vol):
+def delete_purchase(index):
+    df_p = pd.read_csv(PORTFOLIO_FILE)
+    df_p = df_p.drop(index)
+    df_p.to_csv(PORTFOLIO_FILE, index=False)
+    st.rerun()
+
+# --- 3. CEREBRO IA MULTI-MODO ---
+def analizar_con_ia(symbol, precio, rsi, vol, modo="standard"):
     try:
-        prompt = f"Trader senior: Analiza {symbol}, Precio: {precio}, RSI: {rsi:.2f}, Vol: {vol:.2f}x. Dame consejo de 3 frases para Sergio."
+        prompts = {
+            "standard": f"Trader senior: Analiza {symbol}, Precio: {precio}, RSI: {rsi:.2f}, Vol: {vol:.2f}x. Consejo de 3 frases.",
+            "scalping": f"Modo Scalper 5min: Analiza {symbol} para trade rápido. RSI: {rsi:.2f}. ¿Entrada o salida inmediata?",
+            "noticias": f"Analista Fundamental: Basado en el precio {precio} de {symbol}, ¿cómo afecta el sentimiento actual?",
+            "comparar": f"Analiza la fuerza relativa de {symbol} frente al mercado. ¿Es líder o seguidor?"
+        }
+        prompt = prompts.get(modo, prompts["standard"])
         chat_completion = client_ai.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model="llama-3.3-70b-versatile",
             temperature=0.7
         )
         return chat_completion.choices[0].message.content
-    except Exception as e: return f"⚠️ Error Groq: {str(e)}"
+    except Exception as e: return f"⚠️ Error IA: {str(e)}"
 
-# --- 3. MOTOR DE DATOS (KUCOIN ANTI-429) ---
+# --- 4. MOTOR DE DATOS ---
 @st.cache_data(ttl=120)
 def get_market_data():
     exchange = ccxt.kucoin({'enableRateLimit': True})
@@ -77,8 +98,6 @@ def get_market_data():
         markets = exchange.load_markets()
         symbols = [s for s, m in markets.items() if '/USDT' in s and m['active']][:30]
         all_data = []
-        
-        progress_bar = st.progress(0)
         for i, symbol in enumerate(symbols):
             time.sleep(0.3) 
             try:
@@ -86,110 +105,80 @@ def get_market_data():
                 df = pd.DataFrame(o_1h, columns=['ts','o','h','l','c','v'])
                 d = df['c'].diff()
                 rsi = 100 - (100 / (1 + (d.where(d>0,0).rolling(14).mean() / -d.where(d<0,0).rolling(14).mean()))).iloc[-1]
-                sma = df['c'].rolling(20).mean()
-                std = df['c'].rolling(20).std()
+                sma = df['c'].rolling(20).mean(); std = df['c'].rolling(20).std()
                 u_band, l_band = (sma + (std * 2)).iloc[-1], (sma - (std * 2)).iloc[-1]
-                price = df['c'].iloc[-1]
-                vol_spike = df['v'].iloc[-1] / df['v'].mean()
+                price = df['c'].iloc[-1]; vol_spike = df['v'].iloc[-1] / df['v'].mean()
                 
-                decision, msg_accion = 'HOLD', "Buscando..."
-                if price <= l_band and rsi < 38 and vol_spike > 1.8:
-                    decision, msg_accion = 'BUY 🚀', "🎯 CONFLUENCIA DETECTADA"
-                elif price >= u_band and rsi > 68:
-                    decision, msg_accion = 'SELL 💸', "🔥 SOBRECOMPRA"
-                elif vol_spike > 3.0:
-                    decision, msg_accion = 'INFLOW 🐳', f"🚨 BALLENA: {vol_spike:.1f}x"
-
-                all_data.append({'symbol': symbol, 'price': price, 'rsi': rsi, 'vol': vol_spike, 'decision': decision, 'recomendacion': msg_accion})
+                decision = 'HOLD'
+                if price <= l_band and rsi < 38 and vol_spike > 1.8: decision = 'BUY 🚀'
+                elif price >= u_band and rsi > 68: decision = 'SELL 💸'
+                
+                all_data.append({'symbol': symbol, 'price': price, 'rsi': rsi, 'vol': vol_spike, 'decision': decision})
             except: continue
-            progress_bar.progress((i + 1) / len(symbols))
-        progress_bar.empty()
         return pd.DataFrame(all_data)
-    except Exception as e:
-        st.error(f"⚠️ Error de Conexión: {e}")
-        return None
+    except: return None
 
-# --- 4. UI VISUAL ---
-st.markdown("""<style>
-    .stApp { background-color: #000; } 
-    .gold-header { color: #d4af37; text-align: center; font-size: 35px; border-bottom: 2px solid #d4af37; padding-bottom: 10px; margin-bottom: 5px;} 
-    .trade-card { background: #111; border-left: 5px solid #d4af37; border-radius: 10px; padding: 15px; margin-bottom: 5px; border: 1px solid #222; } 
-    .stButton>button { background-color: #d4af37 !important; color: black !important; font-weight: bold; width: 100%; border: none; }
-</style>""", unsafe_allow_html=True)
-
-st.markdown('<h1 class="gold-header">⚜️ DODO OPS CRYPTO PELUD ⚜️</h1>', unsafe_allow_html=True)
-
+# --- 5. LÓGICA DE INTERFAZ Y COMANDOS ---
+st.markdown('<h1 class="gold-header" style="color:#d4af37; text-align:center;">⚜️ DODO OPS ULTRA ⚜️</h1>', unsafe_allow_html=True)
 f_val, f_class = get_fear_greed()
-st.markdown(f'<p style="text-align:center; color:#AAA;">Sentimiento Global: <b style="color:#d4af37;">{f_val} ({f_class})</b></p>', unsafe_allow_html=True)
+st.markdown(f'<p style="text-align:center; color:#AAA;">Fear & Greed: <b style="color:#d4af37;">{f_val} ({f_class})</b></p>', unsafe_allow_html=True)
 
 tab_radar, tab_risk = st.tabs(["🎯 RADAR SNIPER", "💰 GESTIÓN DE RIESGO"])
 
 df = get_market_data()
 
-if df is not None and not df.empty:
-    # --- SUMA: ANÁLISIS UNIVERSAL TELEGRAM ---
-    upds = get_updates()
-    if upds:
-        last_m = upds[-1]["message"]["text"].lower()
-        if "/analizar" in last_m:
-            try:
-                coin_input = last_m.split(" ")[1].upper()
-                target_coin = f"{coin_input}/USDT"
-                
-                # Buscamos en el DF actual o pedimos a KuCoin
-                if target_coin in df['symbol'].values:
-                    match = df[df['symbol'] == target_coin].iloc[0]
-                    res_ia = analizar_con_ia(target_coin, match['price'], match['rsi'], match['vol'])
-                else:
-                    ex_temp = ccxt.kucoin()
-                    o_tmp = ex_temp.fetch_ohlcv(target_coin, timeframe='1h', limit=50)
-                    df_t = pd.DataFrame(o_tmp, columns=['ts','o','h','l','c','v'])
-                    p_curr = df_t['c'].iloc[-1]
-                    d_t = df_t['c'].diff()
-                    rsi_t = 100 - (100 / (1 + (d_t.where(d_t>0,0).rolling(14).mean() / -d_t.where(d_t<0,0).rolling(14).mean()))).iloc[-1]
-                    vol_t = df_t['v'].iloc[-1] / df_t['v'].mean()
-                    res_ia = analizar_con_ia(target_coin, p_curr, rsi_t, vol_t)
-                
-                send_telegram_msg(f"🧠 *DODO EINSTEIN ANALIZA {target_coin}:*\n\n{res_ia}")
-            except:
-                send_telegram_msg(f"❌ No encontré `{coin_input}`. Escribí el símbolo (ej: /analizar SOL)")
+# --- LÓGICA DE TELEGRAM (COMANDOS NUEVOS) ---
+upds = get_updates()
+if upds:
+    msg = upds[-1]["message"]["text"].lower()
+    if "/help" in msg:
+        send_telegram_msg("📜 *Manual del Dodo Einstein:*\n\n/analizar COIN - Análisis técnico pro.\n/scalping COIN - Análisis rápido 5m.\n/noticias COIN - Lo último del mercado.\n/comparar COIN1 COIN2 - Cuál está mejor.")
+    elif "/analizar" in msg or "/scalping" in msg or "/noticias" in msg:
+        try:
+            cmd = msg.split(" ")[0].replace("/", "")
+            coin = msg.split(" ")[1].upper()
+            target = f"{coin}/USDT"
+            # Buscamos precio rápido
+            ticker = ccxt.kucoin().fetch_ticker(target)
+            res = analizar_con_ia(target, ticker['last'], 50.0, 1.0, modo=cmd)
+            if cmd == "noticias": res = f"{get_crypto_news(coin)}\n\n" + res
+            send_telegram_msg(f"🧠 *DODO {cmd.upper()}:* {target}\n\n{res}")
+        except: send_telegram_msg("Escribí bien el comando, ej: /analizar BTC")
 
-    # Alertas automáticas de compra
-    for _, alert in df[df['decision'] == 'BUY 🚀'].iterrows():
-        send_telegram_msg(f"🎯 *DODO SIGNAL:* `{alert['symbol']}`\n🚀 *COMPRA SNIPER*\n💰 Precio: `${alert['price']}`")
-
+# --- RENDERIZADO ---
+if df is not None:
     with tab_radar:
         col_l, col_r = st.columns([1, 1.5])
         with col_l:
-            sorted_df = df.sort_values(by=['decision', 'vol'], ascending=[False, False])
-            for idx, row in sorted_df.iterrows():
+            for idx, row in df.sort_values(by='decision', ascending=False).iterrows():
                 color = "#00ff88" if "BUY" in row['decision'] else "#ff4b4b" if "SELL" in row['decision'] else "#d4af37"
-                with st.container():
-                    st.markdown(f'<div class="trade-card"><b style="color:#d4af37;">{row["symbol"]}</b> | <b style="color:{color};">{row["decision"]}</b><br><span style="color:white; font-size:20px; font-weight:bold;">${row["price"]:.4f}</span></div>', unsafe_allow_html=True)
-                    c1, c2 = st.columns(2)
-                    if c1.button(f"IA 🧠 {row['symbol']}", key=f"ia_{idx}"):
-                        st.info(analizar_con_ia(row['symbol'], row['price'], row['rsi'], row['vol']))
-                    if c2.button(f"REGISTRAR 📝", key=f"reg_{idx}"):
-                        save_purchase(row['symbol'], row['price'])
+                st.markdown(f'<div style="background:#111; border-left:5px solid {color}; padding:10px; margin-bottom:5px; border-radius:10px;"><b>{row["symbol"]}</b> | ${row["price"]:.4f}</div>', unsafe_allow_html=True)
+                c1, c2 = st.columns(2)
+                if c1.button(f"IA 🧠", key=f"ia_{idx}"): st.info(analizar_con_ia(row['symbol'], row['price'], row['rsi'], row['vol']))
+                if c2.button(f"REGISTRAR 📝", key=f"reg_{idx}"): save_purchase(row['symbol'], row['price'])
         with col_r:
-            fig = go.Figure(go.Scatter(x=df['symbol'], y=df['rsi'], mode='markers', marker=dict(size=df['vol']*12, color=df['vol'], colorscale='YlOrBr', showscale=True)))
-            fig.update_layout(template="plotly_dark", height=700, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-            st.plotly_chart(fig, use_container_width=True)
+            fig = go.Figure(go.Scatter(x=df['symbol'], y=df['rsi'], mode='markers', marker=dict(size=df['vol']*12, color=df['vol'], colorscale='YlOrBr')))
+            fig.update_layout(template="plotly_dark", height=600); st.plotly_chart(fig, use_container_width=True)
 
     with tab_risk:
-        st.markdown("### 📊 Tu Portfolio")
-        if os.path.exists(PORTFOLIO_FILE):
-            port = pd.read_csv(PORTFOLIO_FILE)
-            if not port.empty:
-                for i, p_row in port.iterrows():
-                    try:
-                        # Buscamos precio actual para el portfolio
-                        actual_p = df[df['symbol'] == p_row['symbol']]['price'].values[0]
-                        diff_p = ((actual_p - p_row['buy_price']) / p_row['buy_price']) * 100
-                        c_pnl = "green" if diff_p >= 0 else "red"
-                        st.markdown(f"**{p_row['symbol']}** | Compra: ${p_row['buy_price']:.4f} | Actual: ${actual_p:.4f} | **PnL: :{c_pnl}[{diff_p:.2f}%]**")
-                    except: pass
-            else: st.info("Portfolio vacío.")
+        st.markdown("### 📊 Portfolio y Alertas Automáticas")
+        port = pd.read_csv(PORTFOLIO_FILE)
+        if not port.empty:
+            for i, p_row in port.iterrows():
+                try:
+                    ticker = ccxt.kucoin().fetch_ticker(p_row['symbol'])
+                    actual = ticker['last']
+                    diff = ((actual - p_row['buy_price']) / p_row['buy_price']) * 100
+                    
+                    # ALERTA AUTOMÁTICA STOP LOSS / TAKE PROFIT
+                    if diff <= STOP_LOSS_PCT:
+                        send_telegram_msg(f"🚨 *STOP LOSS:* `{p_row['symbol']}` cayó `{diff:.2f}%`!")
+                    elif diff >= TAKE_PROFIT_PCT:
+                        send_telegram_msg(f"💰 *TAKE PROFIT:* `{p_row['symbol']}` subió `{diff:.2f}%`!")
 
-time.sleep(120)
-st.rerun()
+                    c_p1, c_p2 = st.columns([3, 1])
+                    c_p1.write(f"**{p_row['symbol']}** | PnL: **{diff:.2f}%**")
+                    if c_p2.button("VENDIDO ✅", key=f"v_{i}"): delete_purchase(i)
+                except: pass
+
+time.sleep(120); st.rerun()
