@@ -15,7 +15,6 @@ try:
     CHAT_ID = config.CHAT_ID
     GROQ_API_KEY = config.GROQ_API_KEY
 except Exception:
-    # Para Streamlit Cloud (Settings > Secrets)
     TOKEN_TELEGRAM = st.secrets.get("TOKEN_TELEGRAM")
     CHAT_ID = st.secrets.get("CHAT_ID")
     GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
@@ -28,7 +27,6 @@ if not GROQ_API_KEY:
 
 client_ai = Groq(api_key=GROQ_API_KEY)
 
-# Estabilidad del archivo de Portfolio
 if not os.path.exists(PORTFOLIO_FILE):
     pd.DataFrame(columns=['symbol', 'buy_price', 'time']).to_csv(PORTFOLIO_FILE, index=False)
 
@@ -48,6 +46,13 @@ def send_telegram_msg(message):
         requests.get(url, params=params)
     except: pass
 
+def get_updates():
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN_TELEGRAM}/getUpdates"
+        res = requests.get(url).json()
+        return res.get("result", [])
+    except: return []
+
 def save_purchase(symbol, price):
     new_entry = pd.DataFrame([{'symbol': symbol, 'buy_price': price, 'time': datetime.now().strftime("%Y-%m-%d %H:%M")}])
     pd.concat([pd.read_csv(PORTFOLIO_FILE), new_entry]).to_csv(PORTFOLIO_FILE, index=False)
@@ -64,34 +69,26 @@ def analizar_con_ia(symbol, precio, rsi, vol):
         return chat_completion.choices[0].message.content
     except Exception as e: return f"⚠️ Error Groq: {str(e)}"
 
-# --- 3. MOTOR DE DATOS (KUCOIN CON PAUSAS ANTI-429) ---
-@st.cache_data(ttl=120) # Cache de 2 minutos para no saturar
+# --- 3. MOTOR DE DATOS (KUCOIN ANTI-429) ---
+@st.cache_data(ttl=120)
 def get_market_data():
     exchange = ccxt.kucoin({'enableRateLimit': True})
     try:
         markets = exchange.load_markets()
-        # Reducimos a 30 monedas para mayor estabilidad contra el error 429
         symbols = [s for s, m in markets.items() if '/USDT' in s and m['active']][:30]
         all_data = []
         
         progress_bar = st.progress(0)
         for i, symbol in enumerate(symbols):
-            # PAUSA CRÍTICA: 0.3s entre monedas para que KuCoin no nos eche
             time.sleep(0.3) 
-            
             try:
                 o_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                 df = pd.DataFrame(o_1h, columns=['ts','o','h','l','c','v'])
-                
-                # RSI
                 d = df['c'].diff()
                 rsi = 100 - (100 / (1 + (d.where(d>0,0).rolling(14).mean() / -d.where(d<0,0).rolling(14).mean()))).iloc[-1]
-                
-                # Bollinger
                 sma = df['c'].rolling(20).mean()
                 std = df['c'].rolling(20).std()
                 u_band, l_band = (sma + (std * 2)).iloc[-1], (sma - (std * 2)).iloc[-1]
-                
                 price = df['c'].iloc[-1]
                 vol_spike = df['v'].iloc[-1] / df['v'].mean()
                 
@@ -104,10 +101,8 @@ def get_market_data():
                     decision, msg_accion = 'INFLOW 🐳', f"🚨 BALLENA: {vol_spike:.1f}x"
 
                 all_data.append({'symbol': symbol, 'price': price, 'rsi': rsi, 'vol': vol_spike, 'decision': decision, 'recomendacion': msg_accion})
-            except: continue # Si una moneda falla, seguimos con la otra
-            
+            except: continue
             progress_bar.progress((i + 1) / len(symbols))
-            
         progress_bar.empty()
         return pd.DataFrame(all_data)
     except Exception as e:
@@ -132,7 +127,34 @@ tab_radar, tab_risk = st.tabs(["🎯 RADAR SNIPER", "💰 GESTIÓN DE RIESGO"])
 df = get_market_data()
 
 if df is not None and not df.empty:
-    # Alertas automáticas
+    # --- SUMA: ANÁLISIS UNIVERSAL TELEGRAM ---
+    upds = get_updates()
+    if upds:
+        last_m = upds[-1]["message"]["text"].lower()
+        if "/analizar" in last_m:
+            try:
+                coin_input = last_m.split(" ")[1].upper()
+                target_coin = f"{coin_input}/USDT"
+                
+                # Buscamos en el DF actual o pedimos a KuCoin
+                if target_coin in df['symbol'].values:
+                    match = df[df['symbol'] == target_coin].iloc[0]
+                    res_ia = analizar_con_ia(target_coin, match['price'], match['rsi'], match['vol'])
+                else:
+                    ex_temp = ccxt.kucoin()
+                    o_tmp = ex_temp.fetch_ohlcv(target_coin, timeframe='1h', limit=50)
+                    df_t = pd.DataFrame(o_tmp, columns=['ts','o','h','l','c','v'])
+                    p_curr = df_t['c'].iloc[-1]
+                    d_t = df_t['c'].diff()
+                    rsi_t = 100 - (100 / (1 + (d_t.where(d_t>0,0).rolling(14).mean() / -d_t.where(d_t<0,0).rolling(14).mean()))).iloc[-1]
+                    vol_t = df_t['v'].iloc[-1] / df_t['v'].mean()
+                    res_ia = analizar_con_ia(target_coin, p_curr, rsi_t, vol_t)
+                
+                send_telegram_msg(f"🧠 *DODO EINSTEIN ANALIZA {target_coin}:*\n\n{res_ia}")
+            except:
+                send_telegram_msg(f"❌ No encontré `{coin_input}`. Escribí el símbolo (ej: /analizar SOL)")
+
+    # Alertas automáticas de compra
     for _, alert in df[df['decision'] == 'BUY 🚀'].iterrows():
         send_telegram_msg(f"🎯 *DODO SIGNAL:* `{alert['symbol']}`\n🚀 *COMPRA SNIPER*\n💰 Precio: `${alert['price']}`")
 
@@ -161,13 +183,13 @@ if df is not None and not df.empty:
             if not port.empty:
                 for i, p_row in port.iterrows():
                     try:
-                        actual = df[df['symbol'] == p_row['symbol']]['price'].values[0]
-                        diff = ((actual - p_row['buy_price']) / p_row['buy_price']) * 100
-                        color_pnl = "green" if diff >= 0 else "red"
-                        st.markdown(f"**{p_row['symbol']}** | Compra: ${p_row['buy_price']:.4f} | Actual: ${actual:.4f} | **PnL: :{color_pnl}[{diff:.2f}%]**")
+                        # Buscamos precio actual para el portfolio
+                        actual_p = df[df['symbol'] == p_row['symbol']]['price'].values[0]
+                        diff_p = ((actual_p - p_row['buy_price']) / p_row['buy_price']) * 100
+                        c_pnl = "green" if diff_p >= 0 else "red"
+                        st.markdown(f"**{p_row['symbol']}** | Compra: ${p_row['buy_price']:.4f} | Actual: ${actual_p:.4f} | **PnL: :{c_pnl}[{diff_p:.2f}%]**")
                     except: pass
             else: st.info("Portfolio vacío.")
 
-# Refresco lento para evitar bloqueos de API
 time.sleep(120)
 st.rerun()
