@@ -36,7 +36,7 @@ def get_advanced_whale_data():
     try:
         markets = exchange.load_markets()
         symbols = [s for s, m in markets.items() if '/USDT' in s and m['active']]
-        watchlist = symbols[:50] 
+        watchlist = symbols[:10] 
         all_data = []
         
         # Usamos un spinner para que no veas la pantalla negra
