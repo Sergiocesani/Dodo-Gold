@@ -1,3 +1,5 @@
-portfolio.csv
+.env
 __pycache__/
 *.pyc
+portfolio.csv
+last_id.txt
