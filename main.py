@@ -20,10 +20,9 @@ except Exception:
     GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
 
 PORTFOLIO_FILE = "portfolio.csv"
-STOP_LOSS_PCT = -3.0   # Configurable
-TAKE_PROFIT_PCT = 5.0  # Configurable
+STOP_LOSS_PCT = -3.0   
+TAKE_PROFIT_PCT = 5.0  
 
-# Evitar bucles de Telegram guardando el ID del último mensaje
 if "last_update_id" not in st.session_state:
     st.session_state.last_update_id = 0
 
@@ -54,7 +53,6 @@ def send_telegram_msg(message):
 
 def get_updates():
     try:
-        # Offset para evitar repetición de comandos
         url = f"https://api.telegram.org/bot{TOKEN_TELEGRAM}/getUpdates"
         params = {"offset": st.session_state.last_update_id + 1, "timeout": 1}
         res = requests.get(url, params=params).json()
@@ -76,10 +74,10 @@ def delete_purchase(index):
 def analizar_con_ia(symbol, precio, rsi, vol, modo="standard"):
     try:
         prompts = {
-            "standard": f"Trader senior: Analiza {symbol}, Precio: {precio}, RSI: {rsi:.2f}, Vol: {vol:.2f}x. Consejo de 3 frases para Sergio.",
-            "scalping": f"Modo Scalper 5min: Analiza {symbol} para trade rápido. RSI: {rsi:.2f}. ¿Entrada o salida inmediata?",
-            "noticias": f"Analista Fundamental: Basado en el precio {precio} de {symbol}, ¿qué impacto sugieren los datos actuales?",
-            "comparar": f"Analiza la fuerza relativa de {symbol} frente al mercado. ¿Es líder o seguidor?"
+            "standard": f"Trader senior: Analiza {symbol}, Precio: {precio}, RSI: {rsi:.2f}, Vol: {vol:.2f}x. Consejo de 3 frases.",
+            "scalping": f"Modo Scalper 5min: Analiza {symbol} para trade rápido. RSI: {rsi:.2f}.",
+            "noticias": f"Analista Fundamental: Sobre {symbol} a {precio}, ¿qué impacto sugieren los datos?",
+            "comparar": f"Analiza la fuerza relativa de {symbol} frente al mercado."
         }
         prompt = prompts.get(modo, prompts["standard"])
         chat_completion = client_ai.chat.completions.create(
@@ -90,7 +88,7 @@ def analizar_con_ia(symbol, precio, rsi, vol, modo="standard"):
         return chat_completion.choices[0].message.content
     except Exception as e: return f"⚠️ IA ocupada: {str(e)}"
 
-# --- 4. MOTOR DE DATOS (KUCOIN ANTI-429) ---
+# --- 4. MOTOR DE DATOS (REGLA DE 3 + WHALE SNIPER) ---
 @st.cache_data(ttl=120)
 def get_market_data():
     exchange = ccxt.kucoin({'enableRateLimit': True})
@@ -103,22 +101,37 @@ def get_market_data():
             try:
                 o_1h = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=50)
                 df = pd.DataFrame(o_1h, columns=['ts','o','h','l','c','v'])
+                
+                # Técnicos
                 d = df['c'].diff()
                 rsi = 100 - (100 / (1 + (d.where(d>0,0).rolling(14).mean() / -d.where(d<0,0).rolling(14).mean()))).iloc[-1]
                 sma = df['c'].rolling(20).mean(); std = df['c'].rolling(20).std()
                 u_band, l_band = (sma + (std * 2)).iloc[-1], (sma - (std * 2)).iloc[-1]
-                price = df['c'].iloc[-1]; vol_spike = df['v'].iloc[-1] / df['v'].mean()
+                
+                price = df['c'].iloc[-1]
+                prev_price = df['c'].iloc[-2]
+                price_change_pct = ((price - prev_price) / prev_price) * 100
+                vol_spike = df['v'].iloc[-1] / df['v'].mean()
                 
                 decision = 'HOLD'
-                if price <= l_band and rsi < 38 and vol_spike > 1.8: decision = 'BUY 🚀'
-                elif price >= u_band and rsi > 68: decision = 'SELL 💸'
+                
+                # ESTRATEGIA EXPLOSIVO SILENCIOSO (WHALE SNIPER)
+                if vol_spike > 3.0 and price_change_pct < 3.0 and rsi < 60:
+                    decision = '🐳 WHALE IN'
+                    send_telegram_msg(f"🎯 *WHALE SNIPER:* `{symbol}`\n🔥 Volumen: `{vol_spike:.1f}x` (Anomalía)\n📈 Precio: `{price_change_pct:.2f}%` (Silencioso)\n📊 RSI: `{rsi:.1f}`")
+                
+                # REGLA DE 3 ESTÁNDAR
+                elif price <= l_band and rsi < 38 and vol_spike > 1.8: 
+                    decision = 'BUY 🚀'
+                elif price >= u_band and rsi > 68: 
+                    decision = 'SELL 💸'
                 
                 all_data.append({'symbol': symbol, 'price': price, 'rsi': rsi, 'vol': vol_spike, 'decision': decision})
             except: continue
         return pd.DataFrame(all_data)
     except: return None
 
-# --- 5. UI Y ESTILOS ---
+# --- 5. UI Y LÓGICA DE TELEGRAM ---
 st.markdown("""<style>
     .stApp { background-color: #000; } 
     .gold-header { color: #d4af37; text-align: center; font-size: 35px; border-bottom: 2px solid #d4af37; padding-bottom: 10px; margin-bottom: 15px;} 
@@ -134,33 +147,32 @@ tab_radar, tab_risk = st.tabs(["🎯 RADAR SNIPER", "💰 GESTIÓN DE RIESGO"])
 
 df = get_market_data()
 
-# --- LÓGICA DE TELEGRAM CON OFFSET ---
+# LÓGICA DE TELEGRAM CON OFFSET
 upds = get_updates()
 for update in upds:
     st.session_state.last_update_id = update["update_id"]
-    msg = update["message"]["text"].lower()
-    
-    if "/help" in msg:
-        send_telegram_msg("📜 *Manual:* /analizar, /scalping, /noticias, /comparar (Ej: /analizar BTC)")
-    elif any(cmd in msg for cmd in ["/analizar", "/scalping", "/noticias", "/comparar"]):
-        try:
-            parts = msg.split(" ")
-            cmd = parts[0].replace("/", "")
-            coin = parts[1].upper()
-            target = f"{coin}/USDT"
-            ticker = ccxt.kucoin().fetch_ticker(target)
-            # Para la IA fuera del radar, enviamos RSI 50 neutral por defecto si no lo calculamos
-            res = analizar_con_ia(target, ticker['last'], 50.0, 1.0, modo=cmd)
-            send_telegram_msg(f"🧠 *DODO {cmd.upper()}:* {target}\n\n{res}")
-        except: send_telegram_msg("Escribí bien el comando, ej: /analizar SOL")
+    if "message" in update and "text" in update["message"]:
+        msg = update["message"]["text"].lower()
+        if "/help" in msg:
+            send_telegram_msg("📜 *Manual:* /analizar, /scalping, /noticias, /comparar (Ej: /analizar BTC)")
+        elif any(cmd in msg for cmd in ["/analizar", "/scalping", "/noticias", "/comparar"]):
+            try:
+                parts = msg.split(" ")
+                cmd = parts[0].replace("/", "")
+                coin = parts[1].upper()
+                target = f"{coin}/USDT"
+                ticker = ccxt.kucoin().fetch_ticker(target)
+                res = analizar_con_ia(target, ticker['last'], 50.0, 1.0, modo=cmd)
+                send_telegram_msg(f"🧠 *DODO {cmd.upper()}:* {target}\n\n{res}")
+            except: send_telegram_msg(f"❌ No encontré `{parts[1]}`")
 
-# --- RENDERIZADO DE INTERFAZ ---
+# RENDERIZADO
 if df is not None:
     with tab_radar:
         col_l, col_r = st.columns([1, 1.5])
         with col_l:
-            for idx, row in df.sort_values(by='decision', ascending=False).iterrows():
-                color = "#00ff88" if "BUY" in row['decision'] else "#ff4b4b" if "SELL" in row['decision'] else "#d4af37"
+            for idx, row in df.sort_values(by='vol', ascending=False).iterrows():
+                color = "#00ff88" if "BUY" in row['decision'] or "WHALE" in row['decision'] else "#ff4b4b" if "SELL" in row['decision'] else "#d4af37"
                 st.markdown(f'<div class="trade-card"><b style="color:#d4af37;">{row["symbol"]}</b> | <b style="color:{color};">{row["decision"]}</b><br><span style="color:white; font-size:20px;">${row["price"]:.4f}</span></div>', unsafe_allow_html=True)
                 c1, c2 = st.columns(2)
                 if c1.button(f"IA 🧠", key=f"ia_{idx}"): st.info(analizar_con_ia(row['symbol'], row['price'], row['rsi'], row['vol']))
@@ -174,29 +186,17 @@ if df is not None:
         st.markdown("### 📊 Portfolio y Alertas en Vivo")
         if os.path.exists(PORTFOLIO_FILE):
             port = pd.read_csv(PORTFOLIO_FILE)
-            if not port.empty:
-                for i, p_row in port.iterrows():
-                    try:
-                        # Obtenemos precio actual (del radar o directo)
-                        if p_row['symbol'] in df['symbol'].values:
-                            actual = df[df['symbol'] == p_row['symbol']]['price'].values[0]
-                        else:
-                            actual = ccxt.kucoin().fetch_ticker(p_row['symbol'])['last']
-                        
-                        diff = ((actual - p_row['buy_price']) / p_row['buy_price']) * 100
-                        color_pnl = "green" if diff >= 0 else "red"
-
-                        # ALERTAS AUTOMÁTICAS
-                        if diff <= STOP_LOSS_PCT:
-                            send_telegram_msg(f"🚨 *STOP LOSS:* {p_row['symbol']} cayó `{diff:.2f}%`!")
-                        elif diff >= TAKE_PROFIT_PCT:
-                            send_telegram_msg(f"💰 *TAKE PROFIT:* {p_row['symbol']} subió `{diff:.2f}%`!")
-
-                        col_p1, col_p2 = st.columns([3, 1])
-                        col_p1.markdown(f"**{p_row['symbol']}** | Compra: ${p_row['buy_price']:.4f} | PnL: :{color_pnl}[{diff:.2f}%]")
-                        if col_p2.button("VENDIDO ✅", key=f"v_{i}"):
-                            delete_purchase(i)
-                    except: pass
-            else: st.info("Portfolio vacío.")
+            for i, p_row in port.iterrows():
+                try:
+                    curr = ccxt.kucoin().fetch_ticker(p_row['symbol'])['last']
+                    diff = ((curr - p_row['buy_price']) / p_row['buy_price']) * 100
+                    color_pnl = "green" if diff >= 0 else "red"
+                    if diff <= STOP_LOSS_PCT: send_telegram_msg(f"🚨 *STOP LOSS:* {p_row['symbol']} `{diff:.2f}%`!")
+                    elif diff >= TAKE_PROFIT_PCT: send_telegram_msg(f"💰 *TAKE PROFIT:* {p_row['symbol']} `{diff:.2f}%`!")
+                    
+                    c1, c2 = st.columns([3, 1])
+                    c1.markdown(f"**{p_row['symbol']}** | PnL: :{color_pnl}[{diff:.2f}%]")
+                    if c2.button("VENDIDO ✅", key=f"v_{i}"): delete_purchase(i)
+                except: pass
 
 time.sleep(120); st.rerun()
